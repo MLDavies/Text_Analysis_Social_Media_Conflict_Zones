@@ -1,0 +1,551 @@
+---
+title: "Syria: Topic Modeling, Classification and Territorial Control"
+author: "Michael L. Davies"
+subtitle: ""
+date: "`r Sys.Date()`"
+output:
+  rmdformats::readthedown:
+    highlight: kate
+    code_folding: hide
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+# Data Preprocessing
+
+
+```{r}
+library(tidyverse)
+theme_set(theme_minimal())
+```
+
+## Read the data
+
+```{r}
+df_raw <- read_csv("df_acled_syr_2017_2021.csv")  %>% 
+  rename("id" = "event_id_cnty")
+```
+
+
+
+## Display Data Table
+
+Data filtered for reporting on territorial change
+
+```{r}
+df_territory <- df_raw %>% 
+  filter(sub_event_type %in% c("Government regains territory", "Non-state actor overtakes territory")) 
+
+df_territory %>% count(sub_event_type, sort = T)
+```
+
+
+```{r}
+library(DT)
+```
+
+```{r}
+df_sub <- df_territory %>% 
+  dplyr::select(event_date, actor1, admin1, event_type, sub_event_type)
+
+datatable(df_sub, options = list(pagelength = 5, scrollX = "400px"))
+```
+
+Look at a sample of the text
+
+```{r}
+df_territory %>% 
+  sample_n(2) %>% 
+  pull(notes)
+```
+
+
+## Pre-process the data
+
+- tokenize
+- remove stop words
+
+```{r}
+# https://www.tidytextmining.com/nasa.html
+library(tidytext)
+
+my_stop_words <- c(stop_words$word, "al", "fatalities", "clashes", "ar",
+                   "reported", "injuries", "coded")
+
+tidy_territory <- df_territory %>%
+  mutate(line = row_number()) %>% #annotate a line where each word comes from
+  unnest_tokens(word, notes) %>% #creates one word per row
+  #anti_join(stop_words) %>% 
+  filter(!word %in% my_stop_words,  # remove an extra word
+         str_detect(word, "[a-z]")) # keep only words
+```
+
+
+## Initial simple exploration
+What are the most common words? 
+
+```{r}
+tidy_territory %>%
+  group_by(sub_event_type) %>% 
+  count(word, sort = TRUE) %>% 
+  ungroup()
+```
+
+
+Word co-ocurrences and correlations
+
+- Networks of words
+
+
+```{r}
+library(widyr)
+
+title_word_pairs <- tidy_territory %>% 
+  group_by(sub_event_type) %>% 
+  pairwise_count(word, id, sort = TRUE, upper = FALSE) %>% 
+  ungroup()
+
+title_word_pairs
+```
+
+
+## Plot networks of co-occurring words 
+
+- These are the pairs of words that occur together most often when the non-state actor overtakes territory.
+
+```{r fig.width=10}
+library(ggplot2)
+library(igraph)
+library(ggraph)
+
+set.seed(1234)
+title_word_pairs %>%
+  filter(sub_event_type == "Non-state actor overtakes territory") %>% 
+  dplyr::select(item1, item2, n) %>% 
+  filter(n >= 150) %>%
+  dplyr::select(item1, item2, n) %>% 
+  graph_from_data_frame() %>%
+  ggraph(layout = "fr") +
+  geom_edge_link(aes(edge_alpha = n, edge_width = n), edge_colour = "cyan4") +
+  geom_node_point(size = 5) +
+  geom_node_text(aes(label = name), repel = TRUE, 
+                 point.padding = unit(0.2, "lines")) +
+  theme_void()
+```
+
+These are the pairs of words that occur together most often when the Government regains territory.
+
+```{r}
+set.seed(1234)
+title_word_pairs %>%
+  filter(sub_event_type == "Government regains territory") %>% 
+  dplyr::select(item1, item2, n) %>% 
+  filter(n >= 150) %>%
+  dplyr::select(item1, item2, n) %>% 
+  graph_from_data_frame() %>%
+  ggraph(layout = "fr") +
+  geom_edge_link(aes(edge_alpha = n, edge_width = n), edge_colour = "darkred") +
+  geom_node_point(size = 5) +
+  geom_node_text(aes(label = name), repel = TRUE, 
+                 point.padding = unit(0.2, "lines")) +
+  theme_void()
+```
+
+
+Sorted by tf-idf
+
+```{r}
+territory_tf_idf <- tidy_territory %>% 
+  count(id, word, sort = TRUE) %>%
+  ungroup() %>%
+  bind_tf_idf(word, id, n)
+
+territory_tf_idf %>% 
+  arrange(-tf_idf)
+```
+
+```{r}
+territory_tf_idf <- full_join(territory_tf_idf, tidy_territory, by = "id")
+```
+
+```{r eval=FALSE}
+territory_tf_idf %>% 
+  filter(!near(tf, 1)) %>%
+  filter(sub_event_type %in% c("Government regains territory", "Nonstate group overtakes territory")) %>%
+  arrange(desc(tf_idf)) %>%
+  group_by(sub_event_type) %>%
+  distinct(word, sub_event_type, .keep_all = TRUE) %>%
+  slice_max(tf_idf, n = 15, with_ties = FALSE) %>% 
+  ungroup() %>%
+  mutate(word = factor(word, levels = rev(unique(word)))) %>%
+  ggplot(aes(tf_idf, word, fill = keyword)) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~sub_event_type, ncol = 2, scales = "free") +
+  labs(title = "Highest tf-idf words",
+       x = "tf-idf", y = NULL)
+```
+
+
+Latent Dirichlet Allocation with the topicmodels package
+
+
+```{r}
+# https://juliasilge.github.io/tidytext/articles/topic_modeling.html
+# 
+# Right now this data frame is in a tidy form, with one-term-per-document-per-row. However, the topicmodels package requires a DocumentTermMatrix (from the tm package). As described in this vignette, we can cast a one-token-per-row table into a DocumentTermMatrix with tidytext’s cast_dtm:
+
+territory_dtm <- tidy_territory %>%
+  count(sub_event_type, word, sort = TRUE) %>% 
+  cast_dtm(sub_event_type, word, n)
+
+```
+
+```{r}
+# In this case, I'm setting it k= 6; in practice we may need to try a few different values of k.
+library(topicmodels)
+territory_lda <- LDA(territory_dtm, k = 6, control = list(seed = 1234))
+territory_lda
+```
+
+
+```{r}
+territory_lda_td <- tidy(territory_lda)
+```
+
+
+Find the top 5 terms within each topic:
+
+```{r}
+top_terms <- territory_lda_td %>%
+  group_by(topic) %>%
+  top_n(10, beta) %>%
+  ungroup() %>%
+  arrange(topic, -beta)
+```
+
+
+```{r fig.width=10}
+theme_set(theme_bw())
+
+top_terms %>%
+  mutate(term = reorder_within(term, beta, topic)) %>%
+  mutate(topic = paste0("Topic ", topic)) %>% 
+  ggplot(aes(term, beta, fill = topic)) +
+  geom_histogram(stat = "identity", alpha = 0.8) +
+  scale_x_reordered() +
+  scale_y_continuous(limits = c(0,NA), expand = c(0, 0)) +
+  theme(legend.position = "None") +
+  coord_flip()+
+  facet_wrap(~ topic, scales = "free_y", ncol = 3)
+```
+
+Find co-occurances with the word "islamic" as most of the violent groups are accused of being "islamic" in social media.
+
+```{r}
+title_word_pairs %>% 
+  filter(item1 == "islamic" | item2 == "islamic")
+```
+
+## Now looking at bi-grams
+
+```{r}
+tidy_bigram <- df_territory %>%
+  mutate(line = row_number()) %>% #annotate a line where each word comes from
+  unnest_tokens(bigram, notes, token = "ngrams", n = 2) #creates one bigram per row
+#anti_join(stop_words) %>% 
+#filter(str_detect(word, "[a-z]")) # keep only words
+
+tidy_bigram %>%
+  count(bigram, sort = TRUE)
+
+library(tidyr)
+
+my_stop_words <- c(stop_words$word, "al", "coded", "of") #"2020", "2019", "2018", "2017",
+
+
+bigrams_separated <- tidy_bigram %>%
+  separate(bigram, c("word1", "word2"), sep = " ")
+
+bigrams_filtered <- bigrams_separated %>%
+  filter(!word1 %in% my_stop_words, 
+         str_detect(word1, "[a-z]")) %>%
+  filter(!word2 %in% my_stop_words, 
+         str_detect(word2, "[a-z]"))
+#str_detect(word1, [0-9])
+
+# new bigram counts:
+bigram_counts <- bigrams_filtered %>% 
+  count(word1, word2, sort = TRUE)
+
+bigrams_united <- bigrams_filtered %>%
+  unite(bigram, word1, word2, sep = " ") #Convenience function to paste together multiple columns into one.
+
+bigrams_united %>% 
+  filter(str_detect(bigram, "islamic")) %>% 
+  count(bigram, sort = TRUE) %>% 
+  mutate(bigram = fct_reorder(bigram, n)) %>% 
+  head(20) %>% 
+  ggplot(aes(bigram, n)) +
+  geom_col() +
+  coord_flip() +
+  #facet_wrap(~ sub_event_type) +
+  labs(title = "Common 'Bigrams' with 'Islamic'")
+
+# tidy_bigram %>% 
+#   select(sub_event_type, bigram) %>% 
+#   filter(str_detect(bigram, "islamic")) %>% 
+#   count(sub_event_type)
+```
+
+```{r}
+bigrams_united %>% 
+  filter(str_detect(bigram, "control")) %>% 
+  count(bigram, sort = TRUE) %>% 
+  mutate(bigram = fct_reorder(bigram, n)) %>% 
+  head(20) %>% 
+  ggplot(aes(bigram, n)) +
+  geom_col() +
+  coord_flip() +
+  #facet_wrap(~ sub_event_type) +
+  labs(title = "Common 'Bigrams' with 'control'")
+```
+
+```{r}
+bigrams_united %>% 
+  count(sub_event_type, bigram, sort = TRUE) %>% 
+  mutate(bigram = fct_reorder(bigram, n)) %>% 
+  head(20) %>% 
+  ggplot(aes(bigram, n)) +
+  geom_col() +
+  coord_flip() +
+  facet_wrap(~sub_event_type, scales = "free") +
+  #facet_wrap(~ sub_event_type) +
+  labs(title = "Common 'Bigrams' with 'control'")
+```
+
+
+```{r fig.height=8}
+bigrams_united %>% 
+  count(admin1, sub_event_type, bigram, sort = TRUE) %>% 
+  mutate(bigram = fct_reorder(bigram, n)) %>% 
+  head(20) %>% 
+  ggplot(aes(bigram, n, fill=sub_event_type)) +
+  geom_col(position = "dodge") +
+  labs(fill = "",
+       x = "") +
+  coord_flip() +
+  facet_wrap(~admin1, scales = "free") +
+  theme(legend.position = "bottom")
+```
+
+
+
+
+# Topic model
+
+From a different tutorial - possibly text_modeling_tutorial
+
+```{r}
+library(quanteda) #for a document frequency matrix (a special case of the doc term matrix)
+library(stm)
+
+tidy_text <- tidy_territory
+
+text_dfm <- tidy_text %>%
+  count(sub_event_type, word, sort = TRUE) %>%
+  cast_dfm(sub_event_type, word, n)
+
+text_sparse <- tidy_text %>%
+  count(sub_event_type, word, sort = TRUE) %>%
+  cast_sparse(sub_event_type, word, n)
+```
+
+
+```{r}
+topic_model <- stm(text_dfm, K = 2, #looking for 2 topics (judgment call?)
+                   verbose = FALSE, init.type = "Spectral")
+```
+
+
+```{r}
+td_beta <- tidy(topic_model)
+
+td_beta %>%
+  group_by(topic) %>%
+  top_n(10, beta) %>%
+  ungroup() %>%
+  mutate(topic = paste0("Topic ", topic),
+         term = reorder_within(term, beta, topic)) %>%
+  ggplot(aes(term, beta, fill = as.factor(topic))) +
+  geom_col(alpha = 0.8, show.legend = FALSE) +
+  facet_wrap(~ topic, scales = "free_y") +
+  coord_flip() +
+  scale_x_reordered() +
+  labs(x = NULL, y = expression(beta),
+       title = "Highest word probabilities for each topic",
+       subtitle = "Different words are associated with different topics")
+```
+
+
+Now, the probability that each document is generated from each topic.
+
+Honestly, I don't really understand this approach.
+
+```{r}
+td_gamma <- tidy(topic_model, matrix = "gamma",                    
+                 document_names = rownames(text_dfm))
+
+ggplot(td_gamma, aes(gamma, fill = as.factor(topic))) +
+  geom_histogram(alpha = 0.8, show.legend = FALSE) +
+  facet_wrap(~ topic, ncol = 3) +
+  labs(title = "Distribution of document probabilities for each topic",
+       y = "Number of ?", x = expression(gamma))
+```
+
+
+# Log Reg - bootstrapped
+
+```{r}
+# https://juliasilge.com/blog/animal-crossing/
+
+library(tidymodels)
+set.seed(123)
+model_split <- initial_split(df_territory, strata = sub_event_type)
+model_train <- training(model_split)
+model_test <- testing(model_split)
+```
+
+Preprocess the data for modeling. 
+
+```{r}
+library(textrecipes)
+
+model_rec <- recipe(sub_event_type ~ notes + admin2 + fatalities + event_date, data = model_train) %>%
+  step_date(event_date, features = c("month", "dow"), role = "dates") %>%
+  step_rm(event_date) %>%
+  step_dummy(has_role("dates")) %>%
+  step_tokenize(notes) %>%
+  step_stopwords(notes) %>%
+  step_ngram(notes, num_tokens = 2, min_num_tokens = 1) %>%
+  step_tokenfilter(notes, max_tokens = 500) %>%
+  step_tfidf(notes) %>% 
+  step_dummy(admin2) %>% 
+  step_normalize(all_predictors())
+
+model_prep <- prep(model_rec)
+
+model_prep %>% juice()
+```
+
+Using lasso out of interest.
+
+```{r}
+lasso_spec <- logistic_reg(penalty = tune(), mixture = 1) %>%
+  set_engine("glmnet")
+
+lasso_wf <- workflow() %>%
+  add_recipe(model_rec) %>%
+  add_model(lasso_spec)
+
+lasso_wf
+```
+
+# Tune model parameters
+
+Set of possible regularization parameters to try.
+
+```{r}
+lambda_grid <- grid_regular(penalty(), levels = 40)
+
+#Next, we need a set of resampled data to fit and evaluate all these models.
+
+set.seed(234)
+model_folds <- bootstraps(model_train, strata = sub_event_type)
+model_folds
+```
+
+```{r}
+doParallel::registerDoParallel()
+
+set.seed(2020)
+lasso_grid <- tune_grid(
+  lasso_wf,
+  resamples = model_folds,
+  grid = lambda_grid,
+  metrics = metric_set(roc_auc, ppv, npv)
+)
+```
+
+
+```{r}
+# Once we have our tuning results, we can examine them in detail.
+lasso_grid %>%
+  collect_metrics()
+```
+
+
+```{r}
+# Visualization is often more helpful to understand model performance.
+
+lasso_grid %>%
+  collect_metrics() %>%
+  ggplot(aes(penalty, mean, color = .metric)) +
+  geom_line(size = 1.5, show.legend = FALSE) +
+  facet_wrap(~.metric) +
+  scale_x_log10()
+```
+
+## Choose the final model based on AUC. 
+
+```{r}
+best_auc <- lasso_grid %>%
+  select_best("roc_auc")
+
+best_auc
+```
+
+```{r}
+final_lasso <- finalize_workflow(lasso_wf, best_auc)
+
+final_lasso
+```
+
+
+```{r}
+library(vip)
+
+final_lasso %>%
+  fit(model_train) %>%
+  pull_workflow_fit() %>%
+  vi(lambda = best_auc$penalty) %>%
+  group_by(Sign) %>%
+  top_n(20, wt = abs(Importance)) %>%
+  ungroup() %>%
+  mutate(Sign = factor(Sign, c("POS", "NEG"), c("Government", "NSAG"))) %>%
+  mutate(
+    Importance = abs(Importance),
+    Variable = str_remove(Variable, "tfidf_notes_"),
+    Variable = str_remove(Variable, "admin2_"),
+    Variable = fct_reorder(Variable, Importance)
+  ) %>%
+  ggplot(aes(x = Importance, y = Variable, fill = Sign)) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~Sign, scales = "free_y") +
+  labs(y = NULL)
+```
+
+```{r}
+model_final <- last_fit(final_lasso, model_split)
+
+model_final %>%
+  collect_metrics()
+```
+
+```{r}
+model_final %>%
+  collect_predictions() %>%
+  conf_mat(sub_event_type, .pred_class)
+```
+
